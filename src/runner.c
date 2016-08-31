@@ -210,9 +210,25 @@ static int get_default_gw_inet_addr(struct nl_sock *sk, struct nl_addr **addr)
     return 0;
 }
 
+#define PARAM_USE_NET  (1 << 0)
+#define PARAM_USE_DISK (1 << 1)
+
+static void usage(const char *prog)
+{
+    fprintf(stderr, "usage: %s HYPERVISOR [ HOPTS... ] UNIKERNEL -- [ ARGS... ]\n", prog);
+    fprintf(stderr, "HYPERVISOR: qemu | kvm | /path/to/ukvm-bin | unix\n");
+    fprintf(stderr, "     HOPTS: [ --net ] [ --disk=/path/to/diskfile ]\n");
+    exit(1);
+}
+
 int main(int argc, char *argv[])
 {
+    char *prog;
     char *unikernel;
+    char *hypervisor_exe;
+    //char *param_disk;
+    int params = 0;
+    
     enum {
         QEMU,
         KVM,
@@ -220,29 +236,71 @@ int main(int argc, char *argv[])
         UNIX
     } hypervisor;
 
-    if (argc < 3) {
-        fprintf(stderr, "usage: runner HYPERVISOR UNIKERNEL [ ARGS... ]\n");
-        fprintf(stderr, "HYPERVISOR: qemu | kvm | ukvm | unix\n");
-        return 1;
-    }
-    if (strcmp(argv[1], "qemu") == 0)
+    prog = basename(*argv);
+    argc--;
+    argv++;
+
+    if (argc < 2)
+        usage(prog);
+    
+    if (strcmp(*argv, "qemu") == 0) {
         hypervisor = QEMU;
-    else if (strcmp(argv[1], "kvm") == 0)
+        hypervisor_exe = "/usr/bin/qemu-system-x86_64";
+    } else if (strcmp(*argv, "kvm") == 0) {
         hypervisor = KVM;
-    else if (strcmp(argv[1], "ukvm") == 0)
+        hypervisor_exe = "/usr/bin/qemu-system-x86_64";
+    } else if (strcmp(basename(*argv), "ukvm-bin") == 0) {
         hypervisor = UKVM;
-    else if (strcmp(argv[1], "unix") == 0)
+        hypervisor_exe = *argv;
+    } else if (strcmp(*argv, "unix") == 0) {
         hypervisor = UNIX;
-    else {
-        fprintf(stderr, "error: Invalid hypervisor: %s\n", argv[1]);
+        hypervisor_exe = NULL;
+    } else {
+        fprintf(stderr, "error: Invalid hypervisor: %s\n", *argv);
         return 1;
     }
-    unikernel = argv[2];
+    argc--;
+    argv++;
+
+    /* match hypervisor options */
+    do {
+        if (!strcmp("--help", *argv)) {
+            usage(prog);
+        } else if (!strcmp("--net", *argv)) {
+            params |= PARAM_USE_NET;
+        /* } else if (!strncmp("--disk=", *argv, 7)) { */
+        /*     params |= PARAM_USE_DISK; */
+        /*     param_disk = *argv + 7; */
+        } else {
+            break;
+        }
+
+        argc--;
+        argv++;
+    } while (*argv);
+
+    if (!*argv)
+        usage(prog);
+
+    if (*argv[0] == '-') {
+        printf("Invalid option: %s\n", *argv);
+        return 1;
+    }
+
+    unikernel = *argv;
+    argc--;
+    argv++;
+
+    if (argc) {
+        if (strcmp("--", *argv))
+            usage(prog);
+        argc--;
+        argv++;
+    }
+
     /*
      * Remaining arguments are to be passed on to the unikernel.
      */
-    argv += 3;
-    argc -= 3;
 
     /*
      * Check we have CAP_NET_ADMIN.
@@ -389,7 +447,7 @@ int main(int argc, char *argv[])
      */
     char uarg_ip[AF_INET_BUFSIZE];
     if (inet_ntop(AF_INET, nl_addr_get_binary_addr(veth_addr), uarg_ip,
-            sizeof uarg_ip) == NULL) {
+                  sizeof uarg_ip) == NULL) {
         perror("inet_ntop()");
         return 1;
     }
@@ -401,14 +459,14 @@ int main(int argc, char *argv[])
         netmask |= (1 << b);
     }
     if (inet_ntop(AF_INET, &netmask, uarg_netmask,
-            sizeof uarg_netmask) == NULL) {
+                  sizeof uarg_netmask) == NULL) {
         perror("inet_ntop()");
         return 1;
     }
 
     char uarg_gw[AF_INET_BUFSIZE];
     if (inet_ntop(AF_INET, nl_addr_get_binary_addr(gw_addr), uarg_gw,
-            sizeof uarg_gw) == NULL) {
+                  sizeof uarg_gw) == NULL) {
         perror("inet_ntop()");
         return 1;
     }
@@ -423,7 +481,7 @@ int main(int argc, char *argv[])
      * /usr/bin/qemu-system-x86_64 <qemu args> -kernel <unikernel> -append "<unikernel args>"
      */
     if (hypervisor == QEMU || hypervisor == KVM) {
-        pvadd(uargpv, "/usr/bin/qemu-system-x86_64");
+        pvadd(uargpv, hypervisor_exe);
         pvadd(uargpv, "-vga");
         pvadd(uargpv, "none");
         pvadd(uargpv, "-nographic");
@@ -439,15 +497,18 @@ int main(int argc, char *argv[])
             pvadd(uargpv, "-cpu");
             pvadd(uargpv, "Broadwell");
         }
-        pvadd(uargpv, "-device");
-        pvadd(uargpv, "virtio-net,netdev=n0");
-        pvadd(uargpv, "-netdev");
-        err = asprintf(&uarg_buf, "tap,id=n0,ifname=%s,script=no,downscript=no",
-            TAP_LINK_NAME);
-        assert(err != -1);
-        pvadd(uargpv, uarg_buf);
+        if (params & PARAM_USE_NET) {
+            pvadd(uargpv, "-device");
+            pvadd(uargpv, "virtio-net,netdev=n0");
+            pvadd(uargpv, "-netdev");
+            err = asprintf(&uarg_buf, "tap,id=n0,ifname=%s,script=no,downscript=no",
+                           TAP_LINK_NAME);
+            assert(err != -1);
+            pvadd(uargpv, uarg_buf);
+        }
         pvadd(uargpv, "-kernel");
         pvadd(uargpv, unikernel);
+
         pvadd(uargpv, "-append");
         /*
          * TODO: Replace any occurences of ',' with ',,' in -append, because
@@ -456,9 +517,10 @@ int main(int argc, char *argv[])
         char cmdline[1024];
         char *cmdline_p = cmdline;
         size_t cmdline_free = sizeof cmdline;
+        memset(cmdline, 0, 1024);
         for (; *argv; argc--, argv++) {
             size_t alen = snprintf(cmdline_p, cmdline_free, "%s%s", *argv,
-                    (argc > 1) ? " " : "");
+                                   (argc > 1) ? " " : "");
             if (alen >= cmdline_free) {
                 fprintf(stderr, "error: Command line too long\n");
                 return 1;
@@ -466,12 +528,15 @@ int main(int argc, char *argv[])
             cmdline_free -= alen;
             cmdline_p += alen;
         }
-        size_t alen = snprintf(cmdline_p, cmdline_free,
-                "--ip=%s --netmask=%s --gateways=%s",
-                uarg_ip, uarg_netmask, uarg_gw);
-        if (alen >= cmdline_free) {
-            fprintf(stderr, "error: Command line too long\n");
-            return 1;
+
+        if (params & PARAM_USE_NET) {
+            size_t alen = snprintf(cmdline_p, cmdline_free,
+                                   " --ip=%s --netmask=%s --gateways=%s",
+                                   uarg_ip, uarg_netmask, uarg_gw);
+            if (alen >= cmdline_free) {
+                fprintf(stderr, "error: Command line too long\n");
+                return 1;
+            }
         }
         pvadd(uargpv, cmdline);
     }
@@ -480,24 +545,30 @@ int main(int argc, char *argv[])
      * /unikernel/ukvm <ukvm args> <unikernel> -- <unikernel args>
      */
     else if (hypervisor == UKVM) {
-        pvadd(uargpv, "/unikernel/ukvm");
-        err = asprintf(&uarg_buf, "--net=%s", TAP_LINK_NAME);
-        assert(err != -1);
-        pvadd(uargpv, uarg_buf);
+        pvadd(uargpv, hypervisor_exe);
+        
+        if (params & PARAM_USE_NET) {
+            err = asprintf(&uarg_buf, "--net=%s", TAP_LINK_NAME);
+            assert(err != -1);
+            pvadd(uargpv, uarg_buf);
+        }
         pvadd(uargpv, unikernel);
         pvadd(uargpv, "--");
         for (; *argv; argc--, argv++) {
             pvadd(uargpv, *argv);
         }
-        err = asprintf(&uarg_buf, "--ip=%s", uarg_ip);
-        assert(err != -1);
-        pvadd(uargpv, uarg_buf);
-        err = asprintf(&uarg_buf, "--netmask=%s", uarg_netmask);
-        assert(err != -1);
-        pvadd(uargpv, uarg_buf);
-        err = asprintf(&uarg_buf, "--gateways=%s", uarg_gw);
-        assert(err != -1);
-        pvadd(uargpv, uarg_buf);
+
+        if (params & PARAM_USE_NET) {
+            err = asprintf(&uarg_buf, "--ip=%s", uarg_ip);
+            assert(err != -1);
+            pvadd(uargpv, uarg_buf);
+            err = asprintf(&uarg_buf, "--netmask=%s", uarg_netmask);
+            assert(err != -1);
+            pvadd(uargpv, uarg_buf);
+            err = asprintf(&uarg_buf, "--gateways=%s", uarg_gw);
+            assert(err != -1);
+            pvadd(uargpv, uarg_buf);
+        }
     }
     /*
      * UNIX:
@@ -505,21 +576,25 @@ int main(int argc, char *argv[])
      */
     else if (hypervisor == UNIX) {
         pvadd(uargpv, unikernel);
-        err = asprintf(&uarg_buf, "--network=%s", TAP_LINK_NAME);
-        assert(err != -1);
-        pvadd(uargpv, uarg_buf);
+        if (params & PARAM_USE_NET) {
+            err = asprintf(&uarg_buf, "--network=%s", TAP_LINK_NAME);
+            assert(err != -1);
+            pvadd(uargpv, uarg_buf);
+        }
         for (; *argv; argc--, argv++) {
             pvadd(uargpv, *argv);
         }
-        err = asprintf(&uarg_buf, "--ip=%s", uarg_ip);
-        assert(err != -1);
-        pvadd(uargpv, uarg_buf);
-        err = asprintf(&uarg_buf, "--netmask=%s", uarg_netmask);
-        assert(err != -1);
-        pvadd(uargpv, uarg_buf);
-        err = asprintf(&uarg_buf, "--gateways=%s", uarg_gw);
-        assert(err != -1);
-        pvadd(uargpv, uarg_buf);
+        if (params & PARAM_USE_NET) {
+            err = asprintf(&uarg_buf, "--ip=%s", uarg_ip);
+            assert(err != -1);
+            pvadd(uargpv, uarg_buf);
+            err = asprintf(&uarg_buf, "--netmask=%s", uarg_netmask);
+            assert(err != -1);
+            pvadd(uargpv, uarg_buf);
+            err = asprintf(&uarg_buf, "--gateways=%s", uarg_gw);
+            assert(err != -1);
+            pvadd(uargpv, uarg_buf);
+        }
     }
     char **uargv = (char **)pvfinal(uargpv);
 
@@ -541,8 +616,8 @@ int main(int argc, char *argv[])
      */
     capng_clear(CAPNG_SELECT_BOTH);
     capng_update(CAPNG_ADD,
-            CAPNG_EFFECTIVE | CAPNG_PERMITTED | CAPNG_INHERITABLE,
-            CAP_NET_BIND_SERVICE);
+                 CAPNG_EFFECTIVE | CAPNG_PERMITTED | CAPNG_INHERITABLE,
+                 CAP_NET_BIND_SERVICE);
     if (capng_apply(CAPNG_SELECT_BOTH) != 0) {
         fprintf(stderr, "error: Could not drop capabilities");
         return 1;
@@ -556,3 +631,8 @@ int main(int argc, char *argv[])
             strerror(errno));
     return 1;
 }
+
+
+            
+        
+    
